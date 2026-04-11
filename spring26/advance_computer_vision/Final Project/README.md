@@ -84,7 +84,6 @@ python bird_cv.py ./photos/ --top 2 --output ./my_results/
 ## Files
 
 ```
-FeatherIdentify/
 ├── bird_cv.py          # Main script — bucketing + quality scoring + output
 ├── resize_photos.py    # Optional utility: batch-resize large originals before analysis
 └── README.md
