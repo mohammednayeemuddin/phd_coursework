@@ -75,9 +75,9 @@ python bird_cv.py ./photos/ --top 2 --output ./my_results/
 | `--output` | `results/` | Output directory |
 | `--top N` | `3` | Best picks per bucket (flagged BEST_ and copied to BEST_PICKS/) |
 | `--dump-top N` | all | Only copy top N images into each bucket folder |
-| `--group-threshold F` | `0.08` | Similarity threshold — lower = stricter grouping (0.03–0.10) |
+| `--group-threshold F` | `0.05` | Similarity threshold — lower = stricter grouping (0.03–0.10) |
 | `--save-resized PX` | off | Resize exported images to this long-side pixel count |
-| `--workers N` | auto | Parallel workers (default: min(images, CPU cores, 8)) |
+| `--workers N` | auto | Parallel workers (default: min(images, physical cores)) |
 
 ---
 
@@ -86,6 +86,8 @@ python bird_cv.py ./photos/ --top 2 --output ./my_results/
 ```
 ├── bird_cv.py          # Main script — bucketing + quality scoring + output
 ├── resize_photos.py    # Optional utility: batch-resize large originals before analysis
+├── bench/              # Corpus generator, profiler, determinism regression check
+├── PERFORMANCE.md      # Measured baselines + optimisation record
 └── README.md
 ```
 
@@ -144,8 +146,8 @@ All six axes are measured in the **central subject zone only** — background bo
 
 | Threshold | Behaviour |
 |---|---|
-| `0.03–0.05` | Strict — only near-identical burst shots group together |
-| `0.08` *(default)* | Same scene with slightly different framing |
+| `0.03–0.05` *(0.05 is the default)* | Strict — only near-identical burst shots group together |
+| `0.08` | Same scene with slightly different framing |
 | `0.10–0.15` | Loose — related shots across a session may merge |
 
 ---
@@ -155,9 +157,18 @@ All six axes are measured in the **central subject zone only** — background bo
 | Setup | Speed |
 |---|---|
 | 2-core machine, 77 photos at 1920px | ~19s wall time |
-| 8-core machine, 200 photos at 1920px | ~25–35s estimated |
+| 16-core machine, 77 photos at 1920px | 0.64s |
+| 16-core machine, 24 photos at 6000px | 0.36s |
 
-Scales linearly with CPU cores via `ThreadPoolExecutor`.
+Scales with physical cores via `ThreadPoolExecutor`, with OpenCV pinned to one thread per
+worker so the pool does not oversubscribe.
+
+Large originals are decoded at reduced scale (libjpeg ½/¼) since everything is downscaled
+to 1920px for analysis anyway — so feeding 6000px originals directly is now cheap, and
+`resize_photos.py` is a storage convenience rather than a speed one.
+
+Profiling and regression tools live in `bench/`; measured baselines and the full
+optimisation record are in `PERFORMANCE.md`.
 
 ---
 

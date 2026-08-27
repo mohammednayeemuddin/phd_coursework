@@ -1,0 +1,3 @@
+- [ACV final project — FeatherIdentify](acv-final-project-featheridentify.md) — pure-CV bird photo curator; no-ML is a hard constraint, not a shortcut not yet taken.
+- [bird_cv.py performance profile](bird-cv-performance-profile.md) — optimised ~3x; DENOISE_D is the speed-vs-exact-scores dial.
+- [bird_cv.py bucketing race](bird-cv-bucketing-race.md) — fixed thread-order dependence that used to make picks irreproducible.

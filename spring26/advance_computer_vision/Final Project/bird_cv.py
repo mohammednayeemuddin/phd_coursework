@@ -52,6 +52,7 @@ import json, csv, sys, time, shutil, argparse, threading
 # Sharpness ranking picks same winner as full-res every time.
 # ~3x faster than full res, ~4x more detail than 800px for fine plumage edges.
 ANALYSIS_LONG_SIDE = 1920
+DENOISE_D = 5   # was 9; O(d^2) taps -> ~6x cheaper
 
 # print() lock so threaded workers don't interleave lines
 _print_lock = threading.Lock()
@@ -243,7 +244,10 @@ def group_by_similarity(fingerprints: dict, threshold: float = 0.08) -> list[lis
     This prevents chain-linking where A≈B and B≈C forces A+B+C together
     even when A and C are visually very different.
     """
-    names  = list(fingerprints.keys())
+    # sorted(), not list(): fingerprints is populated in as_completed() order, so
+    # seeding clusters in dict order made bucket membership depend on which thread
+    # finished first — same folder, different BEST picks run to run.
+    names  = sorted(fingerprints.keys())
     vecs   = np.array([fingerprints[n] for n in names], dtype=np.float32)
 
     # Pre-compute full pairwise cosine distance matrix
@@ -347,10 +351,13 @@ def score_color_richness(hsv: np.ndarray) -> float:
     return round(min(10.0, mean_sat/8.0), 2)
 
 def score_composition(gray: np.ndarray) -> float:
-    lap   = np.abs(cv2.Laplacian(gray.astype(np.float32), cv2.CV_32F))
-    smap  = cv2.GaussianBlur(lap, (51,51), 0)
+    # Only the NORMALISED location of the sharpness peak is used, so the saliency
+    # map is built at quarter resolution: same peak, ~16x less blur work.
+    small = cv2.resize(gray, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+    lap   = np.abs(cv2.Laplacian(small.astype(np.float32), cv2.CV_32F))
+    smap  = cv2.GaussianBlur(lap, (13,13), 0)
     _,_,_,ml = cv2.minMaxLoc(smap)
-    h, w  = gray.shape
+    h, w  = small.shape
     px, py = ml[0]/w, ml[1]/h
     edge_dist = min(px, 1-px, py, 1-py)
     if edge_dist < 0.05: return 2.0
@@ -359,22 +366,29 @@ def score_composition(gray: np.ndarray) -> float:
     return round(min(10.0, 4.0 + thirds*4 + edge_dist*6), 2)
 
 def compute_quality(img_bgr, hsv, gray):
+    # Each axis is scored ONCE and reused. Previously bg_sep/fill/color/composition
+    # were each computed twice — once inside the quality_overall sum and again for
+    # their own report field — for identical results at double the cost.
     sh_score, sh_var = score_sharpness(gray)
     ex_score, mean_b = score_exposure(gray)
+    bg_score   = score_bg_separation(gray)
+    fill_score = score_subject_fill(gray)
+    col_score  = score_color_richness(hsv)
+    comp_score = score_composition(gray)
     return {
         "quality_overall": round(
-            sh_score            * 0.35 +
-            score_bg_separation(gray)  * 0.20 +
-            score_subject_fill(gray)   * 0.18 +
-            ex_score            * 0.15 +
-            score_color_richness(hsv)  * 0.07 +
-            score_composition(gray)    * 0.05, 2),
+            sh_score    * 0.35 +
+            bg_score    * 0.20 +
+            fill_score  * 0.18 +
+            ex_score    * 0.15 +
+            col_score   * 0.07 +
+            comp_score  * 0.05, 2),
         "quality_sharpness":    sh_score,
-        "quality_bg_sep":       score_bg_separation(gray),
-        "quality_fill":         score_subject_fill(gray),
+        "quality_bg_sep":       bg_score,
+        "quality_fill":         fill_score,
         "quality_exposure":     ex_score,
-        "quality_color":        score_color_richness(hsv),
-        "quality_composition":  score_composition(gray),
+        "quality_color":        col_score,
+        "quality_composition":  comp_score,
         "sharpness_variance":   sh_var,
         "mean_brightness":      mean_b,
     }
@@ -412,9 +426,56 @@ class ImageScore:
 
 SUPPORTED = {".jpg",".jpeg",".png",".bmp",".tiff",".tif",".webp"}
 
+def _peek_size(path: Path):
+    """Long side of an image from its header, without decoding it.
+    JPEG/PNG only — anything else returns None and we just decode normally."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(2)
+            if head == b"\xff\xd8":                      # JPEG: walk to an SOF marker
+                while True:
+                    b1 = f.read(1)
+                    if not b1: return None
+                    if b1 != b"\xff": continue
+                    while b1 == b"\xff": b1 = f.read(1)
+                    m = b1[0]
+                    if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+                        f.read(3)
+                        h = int.from_bytes(f.read(2), "big")
+                        w = int.from_bytes(f.read(2), "big")
+                        return max(h, w)
+                    seg = int.from_bytes(f.read(2), "big")
+                    if seg < 2: return None
+                    f.seek(seg - 2, 1)
+            if head == b"\x89P":                          # PNG: IHDR is fixed-offset
+                f.seek(16)
+                w = int.from_bytes(f.read(4), "big")
+                h = int.from_bytes(f.read(4), "big")
+                return max(h, w)
+    except Exception:
+        return None
+    return None
+
+
+def imread_for_analysis(path: Path):
+    """Decode at the smallest JPEG scale that still exceeds ANALYSIS_LONG_SIDE.
+    A 6000px original is downscaled to 1920 regardless, so decoding all 24MP is
+    wasted work — libjpeg's 1/2 and 1/4 DCT scaling is far cheaper than a full
+    decode, and the resulting 1920px analysis frame differs by ~0.3/255 levels."""
+    long_side = _peek_size(path)
+    if long_side:
+        for div, flag in ((4, cv2.IMREAD_REDUCED_COLOR_4),
+                          (2, cv2.IMREAD_REDUCED_COLOR_2)):
+            if long_side // div >= ANALYSIS_LONG_SIDE:
+                img = cv2.imread(str(path), flag)
+                if img is not None:
+                    return img
+    return cv2.imread(str(path))
+
+
 def analyze_image(path: Path):
     t0  = time.perf_counter()
-    img = cv2.imread(str(path))
+    img = imread_for_analysis(path)
     if img is None:
         return None, None, None, 0.0
 
@@ -426,7 +487,7 @@ def analyze_image(path: Path):
     scale  = ANALYSIS_LONG_SIDE / max(h0, w0)
     img_r  = cv2.resize(img, (int(w0*scale), int(h0*scale)),
                         interpolation=cv2.INTER_AREA) if scale < 1 else img.copy()
-    img_r  = cv2.bilateralFilter(img_r, 9, 50, 50)
+    img_r  = cv2.bilateralFilter(img_r, DENOISE_D, 50, 50)
     hsv    = cv2.cvtColor(img_r, cv2.COLOR_BGR2HSV)
     gray   = cv2.cvtColor(img_r, cv2.COLOR_BGR2GRAY)
 
@@ -561,7 +622,13 @@ def run(input_path, output_dir="results", top_n=3, group_threshold=0.05,
     # Default workers: min(image count, CPU cores, 8) — no point spinning up
     # more threads than images or cores
     import os
-    workers = n_workers or min(len(images), os.cpu_count() or 2, 8)
+    # OpenCV parallelises internally, so W workers x cv2.getNumThreads() spawns
+    # W*N threads on N cores. Pin OpenCV to 1 thread per worker and let the pool
+    # supply the parallelism instead — no cap at 8, which idled most of the box.
+    cv2.setNumThreads(1)
+    # Half the logical count ~= physical cores; measured faster than either the old
+    # cap of 8 (idled the box) or one worker per hyperthread (cache thrash).
+    workers = n_workers or min(len(images), max(2, (os.cpu_count() or 4) // 2))
 
     print(f"\nFeatherIdentify  |  {len(images)} image(s)  |  "
           f"{workers} workers  |  {ANALYSIS_LONG_SIDE}px analysis  |  output → {out}\n")
@@ -571,6 +638,7 @@ def run(input_path, output_dir="results", top_n=3, group_threshold=0.05,
     total_wall_t0 = time.perf_counter()
 
     def _worker(p: Path):
+        cv2.setNumThreads(1)      # OpenCV thread count is per-thread state
         try:
             fp, fam, quality, ms = analyze_image(p)
             if fp is None:
@@ -598,10 +666,12 @@ def run(input_path, output_dir="results", top_n=3, group_threshold=0.05,
 
     wall_elapsed = (time.perf_counter() - total_wall_t0)
     total_cpu_ms = sum(timing_map.values())
-    print(f"\n  Done — {len(images)} images in {wall_elapsed:.1f}s wall time  "
-          f"({total_cpu_ms/1000:.1f}s total CPU,  "
-          f"{wall_elapsed/(total_cpu_ms/1000)*100:.0f}% parallelism)"
-          if total_cpu_ms > 0 else "")
+    # speedup = CPU time / wall time. The old form printed wall/CPU as a
+    # "% parallelism", so a healthy 13x speedup was reported as "7%".
+    if total_cpu_ms > 0:
+        print(f"\n  Done — {len(images)} images in {wall_elapsed:.1f}s wall time  "
+              f"({total_cpu_ms/1000:.1f}s total CPU,  "
+              f"{(total_cpu_ms/1000)/wall_elapsed:.1f}x speedup on {workers} workers)")
 
     # Phase 2: group by visual similarity
     print(f"\nGrouping by similarity (threshold={group_threshold})…")
